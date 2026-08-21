@@ -23,6 +23,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QDoubleValidator
 from PyQt6.QtWidgets import (
+    QApplication,
     QLineEdit,
     QMainWindow,
     QPushButton,
@@ -172,16 +173,72 @@ class GraphWindow(QMainWindow):
         self.setWindowTitle("Wavefront, PSF & Ray tracing")
         self.resize(1200, 800)
         fig = Figure(facecolor="black")
+        self._figure = fig
         self.canvas = FigureCanvasQTAgg(fig)
         self.setCentralWidget(self.canvas)
         self.ax_wavefront = fig.add_subplot(2, 2, 1, projection="3d", facecolor="black")
         self.ax_psf = fig.add_subplot(2, 2, 2, projection="3d", facecolor="black")
         self.ax_rays = fig.add_subplot(2, 2, 3, projection="3d", facecolor="black")
         self.ax_zoom = fig.add_subplot(2, 2, 4, projection="3d", facecolor="black")
+        self._vertical_axes = (
+            self.ax_wavefront,
+            self.ax_psf,
+            self.ax_rays,
+            self.ax_zoom,
+        )
+        self._synchronized_axes = (self.ax_rays, self.ax_zoom)
+        self._orientation_text = fig.text(
+            0.01,
+            0.01,
+            "",
+            color="white",
+            ha="left",
+            va="bottom",
+            visible=False,
+        )
+        self.canvas.mpl_connect("button_press_event", self._show_orientation)
+        self.canvas.mpl_connect("motion_notify_event", self._keep_z_vertical)
+        self.canvas.mpl_connect("button_release_event", self._keep_z_vertical)
+        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.94, wspace=0.02, hspace=0.08)
         for ax in (self.ax_wavefront, self.ax_psf, self.ax_rays, self.ax_zoom):
             ax.tick_params(colors="white")
             ax.title.set_color("white")
             _transparent_panes(ax)
+
+    def _keep_z_vertical(self, event) -> None:
+        if event.name == "button_release_event":
+            if event.inaxes in self._synchronized_axes:
+                self._sync_bottom_axes(event.inaxes)
+            self._orientation_text.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        if event.inaxes not in self._vertical_axes:
+            return
+        for ax in self._vertical_axes:
+            ax.roll = 0
+        if event.inaxes in self._synchronized_axes:
+            self._sync_bottom_axes(event.inaxes)
+        if event.button is not None:
+            self._set_orientation_text(event.inaxes)
+        self.canvas.draw_idle()
+
+    def _sync_bottom_axes(self, source_ax) -> None:
+        for ax in self._synchronized_axes:
+            if ax is not source_ax:
+                ax.elev = source_ax.elev
+                ax.azim = source_ax.azim
+                ax.roll = 0
+
+    def _show_orientation(self, event) -> None:
+        if event.inaxes in self._vertical_axes:
+            self._set_orientation_text(event.inaxes)
+            self._orientation_text.set_visible(True)
+            self.canvas.draw_idle()
+
+    def _set_orientation_text(self, ax) -> None:
+        self._orientation_text.set_text(
+            f"Elevation: {ax.elev:.1f}°   Azimut: {ax.azim:.1f}°"
+        )
 
     def grab_frame(self) -> np.ndarray:
         self.canvas.draw()
@@ -204,23 +261,45 @@ class GraphWindow(QMainWindow):
         p,
         v,
         lambda_,
+        zerdiam_mm,
         pupdiam_mm,
         defocus_mm,
         axial_mm,
         undersampled: bool,
     ):
         Wd = np.where(Rn > 1, np.nan, W)
+        Kd = np.where(Rn > 1, np.nan, K - c_const)
 
         ax = self.ax_wavefront
         ax.cla()
         ax.set_facecolor("black")
+        wavefront_min = np.nanmin(Wd)
+        wavefront_max = np.nanmax(Wd)
+        wavefront_colors = matplotlib.colormaps["viridis"](
+            np.clip(
+                (np.nan_to_num(Wd, nan=wavefront_min) - wavefront_min)
+                / (wavefront_max - wavefront_min + 1e-30),
+                0,
+                1,
+            )
+        )
+        pupil_radius_m = 0.5e-3 * pupdiam_mm
+        wavefront_colors[:, :, 3] = np.where(
+            np.hypot(Xp, Yp) <= pupil_radius_m,
+            1.0,
+            0.5,
+        )
         ax.plot_surface(
             1e3 * Xp, 1e3 * Yp, 1e6 * Wd, cmap="viridis",
             edgecolor="black", linewidth=0.1, rstride=2, cstride=2, antialiased=True,
+            facecolors=wavefront_colors,
         )
+        ax.set_xlim(-0.5 * zerdiam_mm, 0.5 * zerdiam_mm)
+        ax.set_ylim(-0.5 * zerdiam_mm, 0.5 * zerdiam_mm)
         ax.set_xlabel("mm", color="white")  # PSFguiPrez.m line 286
         ax.set_zlabel("µm", color="white")
         ax.set_zlim(-1, 1)  # PSFguiPrez.m line 287: zlim([-1 1])
+        ax.view_init(elev=30, azim=-60)
         rms = np.nanstd(1e6 * Wd)
         title = f"Wavefront (rms={rms:05.3f} lambda={1e9*lambda_:5.1f} Pd={pupdiam_mm:04.2f})"
         color = "red" if undersampled else "white"
@@ -237,6 +316,8 @@ class GraphWindow(QMainWindow):
             edgecolor="black", linewidth=0.1, rstride=2, cstride=2, antialiased=True,
         )
         ax.view_init(elev=90, azim=-90)  # PSFguiPrez.m line 296: view(0,90)
+        ax.set_xlim(1e6 * xr[0], 1e6 * xr[-1])
+        ax.set_ylim(1e6 * xr[0], 1e6 * xr[-1])
         ax.set_xlabel("µm", color="white")  # PSFguiPrez.m line 295
         ax.set_zticks([])
         ax.set_title(f"PSF (defoc={defocus_mm:05.2f} AL={axial_mm:05.2f})", color="white")
@@ -249,16 +330,26 @@ class GraphWindow(QMainWindow):
         ax.cla()
         ax.set_facecolor("black")
         ax.plot_surface(
-            1e3 * Yp, 1e3 * (K - c_const), 1e3 * Xp, cmap="viridis",
+            1e3 * Yp, 1e3 * Kd, 1e3 * Xp, cmap="viridis",
             edgecolor="black", linewidth=0.1, rstride=4, cstride=4, alpha=0.6,
+            facecolors=wavefront_colors,
         )
+        ax.set_xlim(-0.5 * zerdiam_mm, 0.5 * zerdiam_mm)
+        ax.set_zlim(-0.5 * zerdiam_mm, 0.5 * zerdiam_mm)
         for k in range(len(x)):
             xs = 1e3 * np.array([y[k], y[k], y[k] + v[k, 0] * p[k, 1]])
             ys = 1e3 * np.array([1e-3, z[k], z[k] + v[k, 0] * p[k, 2]])
             zs = 1e3 * np.array([x[k], x[k], x[k] + v[k, 0] * p[k, 0]])
             ax.plot(xs, ys, zs, "-", color=ray_colors[k])
+        ax.set_box_aspect(
+            (
+                np.ptp(ax.get_xlim()),
+                np.ptp(ax.get_ylim()),
+                np.ptp(ax.get_zlim()),
+            )
+        )
         ax.set_title("Ray tracing", color="white")
-        ax.view_init(elev=10, azim=-125)
+        ax.view_init(elev=15, azim=120)
         ax.tick_params(colors="white")
         _transparent_panes(ax)
 
@@ -272,7 +363,7 @@ class GraphWindow(QMainWindow):
             zs = 1e3 * (x[k] + v[k, :] * p[k, 0]) * g
             ax.plot(xs, ys, zs, ".-", color=ray_colors[k])
         ax.set_title("Zoom", color="white")
-        ax.view_init(elev=10, azim=-125)
+        ax.view_init(elev=15, azim=120)
         ax.tick_params(colors="white")
         _transparent_panes(ax)
 
@@ -284,7 +375,7 @@ class ControlWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Wavefront, PSF & Co. - Controls")
+        self.setWindowTitle("Controls")
         self.setStyleSheet("background-color:black;")
         self.graph = GraphWindow()
 
@@ -308,6 +399,8 @@ class ControlWindow(QMainWindow):
             row.edit_left.editingFinished.connect(self.recalc)
             row.edit_right.editingFinished.connect(self.recalc)
         self.setCentralWidget(central)
+        self.resize(330, fh)
+        self.graph.resize(self.graph.width(), self.height())
 
         self.rows[IDX_PUPNORM].set_ratio(0.8)  # PSFguiPrez.m line 75
 
@@ -318,20 +411,24 @@ class ControlWindow(QMainWindow):
         fn = len(PARAM_ROWS)
         narrow_y = ROW_H * fn + 2 * N_ZERNIKE + 2
         narrow_h = 17 * N_ZERNIKE - 2
+        self.btn_close = ClickButton("Close", central)
+        self.btn_close.setGeometry(2, ROW_H * fn, 50, CTRL_H)
         self.btn_refresh = ClickButton("Refresh", central)
-        self.btn_refresh.setGeometry(2, ROW_H * fn, 50, CTRL_H)
+        self.btn_refresh.setGeometry(2, ROW_H * (fn + 1), 50, CTRL_H)
         self.btn_rec = ClickButton("Rec", central)
-        self.btn_rec.setGeometry(2, ROW_H * (fn + 1), 50, CTRL_H)
+        self.btn_rec.setGeometry(2, ROW_H * (fn + 2), 50, CTRL_H)
         self.btn_zero = ClickButton("0", central)
-        self.btn_zero.setGeometry(2, ROW_H * (fn + 2), 50, CTRL_H)
+        self.btn_zero.setGeometry(2, ROW_H * (fn + 3), 50, CTRL_H)
         self.btn_random = ClickButton("?", central)
         self.btn_random.setGeometry(18, narrow_y, 16, narrow_h)
         self.btn_play = ClickButton(">", central)
         self.btn_play.setGeometry(34, narrow_y, 16, narrow_h)
-        for btn in (self.btn_refresh, self.btn_rec, self.btn_zero, self.btn_random, self.btn_play):
+        for btn in (self.btn_close, self.btn_refresh, self.btn_rec, self.btn_zero, self.btn_random, self.btn_play):
             btn.setStyleSheet(f"background-color:{cmd_color}; color:white;")
             btn.raise_()
+        self.btn_close.setStyleSheet("background-color:red; color:white;")
 
+        self.btn_close.clicked.connect(self._close_all_windows)
         self.btn_refresh.clicked.connect(self.recalc)
         self.btn_rec.clicked.connect(self._toggle_record)
         self.btn_zero.clicked.connect(self._zero_zernikes)
@@ -349,8 +446,16 @@ class ControlWindow(QMainWindow):
         self._anim_start: list[float] = []
         self._anim_target: list[float] = []
 
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
+        self.move(screen_geometry.left() + 70, screen_geometry.top() + 45)
+        self.graph.move(screen_geometry.left() + 400, screen_geometry.top() + 45)
         self.graph.show()
         self.recalc()
+
+    def _close_all_windows(self) -> None:
+        self.graph.close()
+        self.close()
+        QApplication.instance().quit()
 
     def _zernike_rows(self) -> list[Row]:
         return [r for r in self.rows if r.is_zernike]
@@ -469,6 +574,7 @@ class ControlWindow(QMainWindow):
         self.graph.refresh(
             Xp, Yp, W, Rn, xr, psf, K, c_const, x, y, z, p, v,
             lambda_=lambda_,
+            zerdiam_mm=1e3 * zerdiam,
             pupdiam_mm=1e3 * pupnorm * zerdiam,
             defocus_mm=1e3 * defocus, axial_mm=1e3 * axial,
             undersampled=undersampled,
